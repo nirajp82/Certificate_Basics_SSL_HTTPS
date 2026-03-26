@@ -3,7 +3,7 @@ To understand why SNI was invented, we must first look at how easy unencrypted w
 
 Imagine your NGINX proxy receives a request from a user and needs to fetch data from your backend Windows server for Tenant 1 (`t1.mycompany.com`).
 1. **The TCP Handshake (Layer 4):** NGINX sends a `SYN` packet to the Windows Server on Port 80. The server replies `SYN-ACK`, and NGINX replies `ACK`. The pipe is open.
-2. **The HTTP Request (Layer 7):** Because there is no encryption, NGINX immediately pushes raw text down the pipe:
+2. **The HTTP Request (Layer 7):** Because there is no encryption, NGINX immediately pushes raw text (Including HOST header) down the pipe:
    ```http
    GET / HTTP/1.1
    Host: t1.mycompany.com
