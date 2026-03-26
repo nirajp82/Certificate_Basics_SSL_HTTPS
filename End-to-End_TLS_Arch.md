@@ -86,7 +86,75 @@ sequenceDiagram
 
 When you fixed the binding (or if you use a wildcard), the handshake succeeds. Here is the deep technical detail of how NGINX and IIS generate the "Secure String" (Session Key) to encrypt the traffic.
 
+Here is how the "Secure String" is generated step-by-step:
 
+```mermaid
+sequenceDiagram
+    participant N as NGINX (Client)
+    participant I as IIS (Windows Server)
+
+    Note over N,I: Step 1 & 2: The Hello Phase & Authentication
+    N->>I: Client Hello (SNI, Ciphers, Client Random String)
+    I->>N: Server Hello (Chosen Cipher, Server Random String)
+    I->>N: Certificate (Contains Public Key)
+    Note left of N: NGINX verifies Certificate Signature
+
+    Note over N,I: Step 3 & 4: The Asymmetric Phase
+    Note left of N: NGINX generates 48-byte Pre-Master Secret
+    Note left of N: NGINX encrypts it using IIS's Public Key
+    N->>I: Encrypted Pre-Master Secret
+    Note right of I: IIS decrypts it using its Private Key
+
+    Note over N,I: Step 5: The Symmetric Phase (The Math)
+    Note left of N: Client Random + Server Random + Pre-Master Secret = Master Secret
+    Note right of I: Client Random + Server Random + Pre-Master Secret = Master Secret
+    Note over N,I: Both derive the identical Symmetric Session Key!
+
+    Note over N,I: Step 6: The Secure Tunnel is Live
+    N->>I: Finished (Encrypted with Symmetric Key)
+    I->>N: Finished (Encrypted with Symmetric Key)
+    Note over N,I: Fast, Two-Way Encrypted HTTP Traffic Begins
+```
+
+
+
+---
+
+### The Multi-Server Dilemma: What Happens When You Have Multiple Servers?
+
+Everything we discussed about **TLS Session Resumption** (caching the session to save CPU) falls apart when you have multiple NGINX servers and multiple Windows servers if a request goes to a different server each time.
+
+Here is exactly what happens and how to fix it.
+
+#### 1. The Frontend Problem (Multiple NGINX Servers)
+Imagine a user connects to **NGINX Server A**. 
+* They do the full handshake (heavy math). 
+* Server A saves the Session ID and the Symmetric Key in its local RAM (`ssl_session_cache`).
+* Five minutes later, the user clicks another link, but your DNS/Load Balancer sends them to **NGINX Server B**.
+
+**What Happens:**
+The user's browser sends a `Client Hello` saying, *"Hey, I have Session ID #12345, let's resume!"* **NGINX Server B** checks its local RAM, says *"I have no idea who you are,"* and **forces a brand new, full handshake**. If your traffic bounces randomly across 5 NGINX servers, your cache is basically useless, and your CPUs will still spike.
+
+**The Solution: TLS Session Tickets**
+Instead of storing the session in the server's RAM (Session IDs), you use **Session Tickets**. 
+* NGINX takes the Symmetric Key, encrypts it into a "Ticket", and gives it to the user's browser to hold onto.
+* When the user hits **NGINX Server B**, they hand over the Ticket.
+* **The Fix:** You must generate a shared encryption key (`ssl_session_ticket_key`) and place that exact same file on *all* your NGINX servers. This allows Server B to decrypt the ticket issued by Server A and instantly resume the session!
+
+#### 2. The Backend Problem (Multiple Windows Servers behind an NLB)
+Now look at the connection between NGINX and the Windows servers. 
+* NGINX establishes a session with **Windows Server 1** through the NLB.
+* NGINX tries to reuse that session (`proxy_ssl_session_reuse on;`), but the NLB routes this specific request to **Windows Server 2**.
+
+**What Happens:**
+Just like above, Windows Server 2 doesn't share RAM with Windows Server 1. It rejects the abbreviated handshake, and NGINX is forced to do the heavy asymmetric math all over again. 
+
+**The Solution: Sticky Sessions (Target Group Stickiness)**
+In IIS, sharing TLS session state across multiple servers is incredibly complex. The industry-standard way to solve this is at the **AWS NLB** layer.
+* You enable **Target Group Stickiness** on your NLB.
+* When NGINX connects to the NLB, the NLB ensures that traffic from that specific NGINX IP *always* goes to **Windows Server 1** for a set period (e.g., 5 minutes). 
+* Because NGINX keeps hitting the exact same Windows server, the Session ID cache works perfectly, the math is skipped, and your backend CPUs stay relaxed.
+  ---
 
 Asymmetric cryptography (Public/Private keys) is mathematically heavy and slow. If you used it to encrypt every megabyte of web traffic, your servers' CPUs would melt. Instead, NGINX and IIS use Asymmetric math *just once* to securely agree on a fast, shared Symmetric key.
 
