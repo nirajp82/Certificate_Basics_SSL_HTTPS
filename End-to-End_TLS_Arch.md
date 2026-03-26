@@ -122,39 +122,84 @@ sequenceDiagram
 
 ### The Multi-Server Dilemma: What Happens When You Have Multiple Servers?
 
-Everything we discussed about **TLS Session Resumption** (caching the session to save CPU) falls apart when you have multiple NGINX servers and multiple Windows servers if a request goes to a different server each time.
 
-Here is exactly what happens and how to fix it.
+### Phase 7: The Multi-Server Dilemma (Frontend vs. Backend Caching)
+
+Everything we discussed about **TLS Session Resumption** (caching the session to save CPU) works perfectly on a single server. However, it completely falls apart when you introduce multiple NGINX servers and multiple Windows servers if a request goes to a different server each time.
+
+Because each hop represents a separate TLS connection, passing traffic across a cluster of servers breaks standard "in-memory" caching. Here is exactly what happens on both sides of your architecture and how it is handled.
+
+
 
 #### 1. The Frontend Problem (Multiple NGINX Servers)
 Imagine a user connects to **NGINX Server A**. 
-* They do the full handshake (heavy math). 
+* They perform the full TLS handshake (heavy math). 
 * Server A saves the Session ID and the Symmetric Key in its local RAM (`ssl_session_cache`).
-* Five minutes later, the user clicks another link, but your DNS/Load Balancer sends them to **NGINX Server B**.
+* Five minutes later, the user clicks another link, but your external DNS/Load Balancer sends them to **NGINX Server B**.
 
 **What Happens:**
-The user's browser sends a `Client Hello` saying, *"Hey, I have Session ID #12345, let's resume!"* **NGINX Server B** checks its local RAM, says *"I have no idea who you are,"* and **forces a brand new, full handshake**. If your traffic bounces randomly across 5 NGINX servers, your cache is basically useless, and your CPUs will still spike.
+The user's browser sends a `Client Hello` saying, *"Hey, I have Session ID #12345, let's resume!"* **NGINX Server B** checks its local RAM, realizes it has no record of that ID, and **forces a brand new, full handshake**. If your traffic bounces randomly across 5 NGINX servers, your RAM cache is basically useless, and your CPUs will still spike.
 
-**The Solution: TLS Session Tickets**
-Instead of storing the session in the server's RAM (Session IDs), you use **Session Tickets**. 
+**The Solution: Shared TLS Session Tickets**
+Instead of storing the session in the server's isolated RAM, you use **Session Tickets**. 
 * NGINX takes the Symmetric Key, encrypts it into a "Ticket", and gives it to the user's browser to hold onto.
 * When the user hits **NGINX Server B**, they hand over the Ticket.
-* **The Fix:** You must generate a shared encryption key (`ssl_session_ticket_key`) and place that exact same file on *all* your NGINX servers. This allows Server B to decrypt the ticket issued by Server A and instantly resume the session!
+* **The Fix:** By generating a shared encryption key (`ssl_session_ticket_key`) and placing that exact same file on *all* your NGINX servers, Server B can seamlessly decrypt the ticket issued by Server A and instantly resume the session!
 
 #### 2. The Backend Problem (Multiple Windows Servers behind an NLB)
-Now look at the connection between NGINX and the Windows servers. 
-* NGINX establishes a session with **Windows Server 1** through the NLB.
-* NGINX tries to reuse that session (`proxy_ssl_session_reuse on;`), but the NLB routes this specific request to **Windows Server 2**.
+Now look at the connection between your NGINX proxies and the backend Windows servers. 
+* NGINX establishes a session with **Windows Server 1** through the AWS NLB.
+* NGINX tries to reuse that session (`proxy_ssl_session_reuse on;`) on the next request, but the NLB routes this specific request to **Windows Server 2**.
+
+
 
 **What Happens:**
-Just like above, Windows Server 2 doesn't share RAM with Windows Server 1. It rejects the abbreviated handshake, and NGINX is forced to do the heavy asymmetric math all over again. 
+Just like the frontend problem, Windows Server 2 does not share RAM with Windows Server 1. It sees the Session ID from NGINX, realizes it has no record of it, and **rejects the abbreviated handshake**. NGINX and Windows Server 2 are forced to do the heavy asymmetric math all over again.
 
-**The Solution: Sticky Sessions (Target Group Stickiness)**
-In IIS, sharing TLS session state across multiple servers is incredibly complex. The industry-standard way to solve this is at the **AWS NLB** layer.
-* You enable **Target Group Stickiness** on your NLB.
-* When NGINX connects to the NLB, the NLB ensures that traffic from that specific NGINX IP *always* goes to **Windows Server 1** for a set period (e.g., 5 minutes). 
-* Because NGINX keeps hitting the exact same Windows server, the Session ID cache works perfectly, the math is skipped, and your backend CPUs stay relaxed.
-  ---
+**The Solution vs. Your Reality:**
+In IIS, sharing TLS session state across multiple servers is incredibly complex. The industry-standard way to solve this is to enable **Sticky Sessions (Target Group Stickiness)** at the AWS NLB layer, forcing NGINX to always hit the same Windows server so the RAM cache works. 
+
+However, **because your architecture explicitly does not use Sticky Sessions**, you are utilizing standard round-robin/hash routing. 
+* **The Reality:** Your system accepts the CPU penalty of performing full TLS handshakes on the backend in exchange for better, more even load distribution across the Windows pool. 
+
+---
+
+### Diagram: Your Architecture in Action
+Here is the sequence diagram showing the frontend successfully resuming sessions via Shared Tickets, while the backend experiences standard cache misses due to the round-robin NLB routing.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User Browser
+    participant N_A as NGINX Server A
+    participant N_B as NGINX Server B
+    participant NLB as AWS NLB
+    participant IIS_1 as Windows Server 1
+    participant IIS_2 as Windows Server 2
+
+    Note over User, IIS_2: 1. Initial Connection & Ticket Creation
+    User->>N_A: Request 1 (Full TLS Handshake)
+    Note over N_A: NGINX A encrypts Session Key into a TICKET<br/>using the "Shared Ticket Key"
+    N_A-->>User: Gives encrypted Ticket to User Browser
+    N_A->>NLB: Proxy Req 1 to Backend
+    NLB->>IIS_1: Routes to IIS 1 (Full TLS Handshake)
+    Note over IIS_1: IIS 1 saves Session ID to its local RAM
+
+    Note over User, IIS_2: 2. Subsequent Connection (Bouncing to New Servers)
+    User->>N_B: Request 2 (Routed to NGINX B)
+    Note over N_B: NGINX B uses "Shared Ticket Key" to decrypt<br/>the user's Ticket. CACHE HIT!
+    N_B-->>User: FAST Resume (Asymmetric Math Skipped!)
+    
+    N_B->>NLB: Proxy Req 2 to Backend
+    Note over NLB: No Sticky Sessions configured!
+    NLB->>IIS_2: NLB routes request to different backend (IIS 2)
+    Note over IIS_2: IIS 2 checks its RAM for Session ID. CACHE MISS!
+    IIS_2-->>N_B: Forces NEW Full TLS Handshake (Heavy Math)
+```
+
+
+
+---
 
 Asymmetric cryptography (Public/Private keys) is mathematically heavy and slow. If you used it to encrypt every megabyte of web traffic, your servers' CPUs would melt. Instead, NGINX and IIS use Asymmetric math *just once* to securely agree on a fast, shared Symmetric key.
 
